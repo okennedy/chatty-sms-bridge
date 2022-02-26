@@ -1,105 +1,126 @@
-from sqlalchemy import create_engine  # type: ignore[import]
-from sqlalchemy import Table, Column, MetaData, Integer, String
-from sqlalchemy import and_
-from sqlalchemy.sql import select
+import asyncio
+from typing import Dict
+from nio import AsyncClient, MatrixRoom, LoginResponse, JoinError, RoomResolveAliasError, RoomInviteError  # type: ignore[import]
+import json
+from socket import gethostname
+import getpass
+import sys
+from os.path import expanduser
+from messages import lookup_sms_messages
 
-metadata = MetaData()
+CONFIG_FILE = expanduser("~/.config/chatty-sms-bridge.json")
 
-Accounts = Table('accounts', metadata, 
-                 Column('id', Integer), 
-                 Column('user_id', Integer), 
-                 Column('password', String),
-                 Column('enabled', Integer), 
-                 Column('protocol', Integer))
+with open(CONFIG_FILE) as f:
+  CONFIG = json.load(f)
 
-Users = Table('users', metadata,
-              Column('id', Integer),
-              Column('username', String),
-              Column('alias', String),
-              Column('avatar_id', Integer),
-              Column('type', Integer))
-
-Messages = Table('messages', metadata,
-                 Column('id', Integer),
-                 Column('uid', String), 
-                 Column('thread_id', Integer),
-                 Column('sender_id', Integer), 
-                 Column('user_alias', String), 
-                 Column('body', String), 
-                 Column('body_type', Integer),
-                 Column('direction', Integer),
-                 Column('time', Integer), 
-                 Column('status', Integer), 
-                 Column('encrypted', Integer),
-                 Column('preview_id', Integer))
-
-Threads = Table('threads', metadata,
-                Column('id', Integer),
-                Column('name', String), 
-                Column('alias', String), 
-                Column('avatar_id', Integer), 
-                Column('account_id', Integer), 
-                Column('type', Integer), 
-                Column('encrypted', Integer), 
-                Column('last_read_id', Integer), 
-                Column('visibility', Integer))
-
-chatty_engine = create_engine('sqlite:////home/mobian/.purple/chatty/db/chatty-history.db', echo=True)
-chatty_connection = chatty_engine.connect()
+ROOM_CACHE: Dict[str, MatrixRoom] = {}
 
 
-def lookup_sms_account():
-    query = (
-      select(Accounts.c.id, 
-             Accounts.c.protocol, 
-             Users.c.type)
-      .where(and_(Accounts.c.user_id == Users.c.id, 
-                  Users.c.username == "SMS"))
+async def main(messages) -> None:
+  if "device-id" in CONFIG:
+    print("Using existing credentials")
+    client = AsyncClient("https://" + CONFIG["homeserver"])
+    client.access_token = CONFIG["access-token"]
+    client.user_id = CONFIG["user-id"]
+    client.device_id = CONFIG["device-id"]
+
+  else:
+    print("Attempting to log in")
+    client = AsyncClient("https://" + CONFIG["homeserver"], CONFIG["bot-user"])
+    client.login(getpass.getpass(), device_name=gethostname())
+    resp = await client.login(CONFIG["password"])
+
+    if(isinstance(resp, LoginResponse)):
+      with open(CONFIG_FILE, "w") as f:
+        CONFIG["user-id"] = resp.user_id
+        CONFIG["device-id"] = resp.device_id
+        CONFIG["access-token"] = resp.access_token
+        json.dump(CONFIG, f)
+        print("Success!")
+    else:
+      print("homeserver = \"{}\"; user = \"{}\"".format(CONFIG["homeserver"], CONFIG["bot-user"]))
+      print(f"Failed to log in: {resp}")
+      sys.exit(1)
+
+  async def get_room(alias):
+    alias = "#{}:{}".format(alias, CONFIG["homeserver"])
+    resp = await client.room_resolve_alias(alias)
+    if isinstance(resp, RoomResolveAliasError):
+      print("Unable to resolve: {}".format(alias))
+      return None
+    else:
+      await client.sync()
+      return client.rooms[resp.room_id]
+
+  async def invite_if_needed(room):
+    await client.sync()
+    if CONFIG["recipient"] not in room.users:
+      if CONFIG["recipient"] not in room.invited_users:
+        resp = await client.room_invite(room.room_id, CONFIG["recipient"])
+        if isinstance(resp, RoomInviteError):
+          print("Unable to invite {} to bridge message room".format(CONFIG["recipient"]))
+          sys.exit(1)
+        else:
+          print("Invited {} to bridge message room".format(CONFIG["recipient"]))
+      else:
+        print("{} is already invited to {}".format(CONFIG["recipient"], room.display_name))
+    else:
+      print("{} is already present in {}".format(CONFIG["recipient"], room.display_name))
+
+  async def get_room_create_and_invite_if_needed(alias, user):
+    if alias in ROOM_CACHE:
+      return ROOM_CACHE[alias]
+    room = await get_room(alias)
+    if room is None:
+      resp = await client.room_create(
+        alias=alias,
+        name=user,
+        topic=""
+      )
+      if(isinstance(resp, JoinError)):
+        print(f"Failed to join {alias} room: {resp}")
+        sys.exit(1)
+      else:
+        room = await get_room(alias)
+        assert(room is not None)
+    await invite_if_needed(room)
+    ROOM_CACHE[alias] = room
+    return room
+
+  # bridge_messages = get_room_create_and_invite_if_needed("sms-bridge")
+
+  async def room_for_thread(thread):
+    alias = "sms_{}".format(thread.replace("+", ""))
+    return await get_room_create_and_invite_if_needed(alias, thread)
+
+  for message in messages:
+    room = await room_for_thread(message.thread_name)
+    await client.room_send(
+        # Watch out! If you join an old room you'll see lots of old messages
+        room_id=room.room_id,
+        message_type="m.room.message",
+        content={
+            "msgtype": "m.text",
+            "body": "{}: {}".format(message.direction_symbol, message.text)
+        }
     )
-    for row in chatty_connection.execute(query):
-        return row
+    print("Last ID now {}".format(message.id))
+    CONFIG["last-id"] = message.id
 
+  client.close()
+#     await client.sync_forever(timeout=30000)  # milliseconds
 
-(SMS_ACCOUNT_ID, SMS_PROTOCOL_ID, SMS_TYPE) = lookup_sms_account()
+if "last-id" in CONFIG:
+  last_id = CONFIG["last-id"]
+else:
+  last_id = -1
 
+last_id = 52200
 
-class Message:
-    def __init__(self, row):
-        self.id           = row[0]  # noqa: E221
-        self.thread_id    = row[1]  # noqa: E221
-        self.thread_name  = row[2]  # noqa: E221
-        self.thread_alias = row[3]  # noqa: E221
-        self.sender       = row[4]  # noqa: E221
-        self.text         = row[5]  # noqa: E221
-        self.direction    = row[6]  # noqa: E221
+messages = lookup_sms_messages(last_id)[:100]
+if len(messages) > 0:
+  asyncio.get_event_loop().run_until_complete(main(messages))
 
-    def __repr__(self):
-        return "{} [{}; {}] {} {}".format(self.sender, self.thread_name, self.thread_id,
-          "←" if self.direction < 0 else "→", self.text)
-
-
-def lookup_sms_messages(since=-1):
-    query = (
-      select(Messages.c.id, 
-             Threads.c.id,
-             Threads.c.name,
-             Users.c.alias, 
-             Threads.c.alias, 
-             Messages.c.body,
-             Messages.c.direction)
-      .where(and_(
-            Messages.c.id > since,
-            Threads.c.account_id == SMS_ACCOUNT_ID,
-            Messages.c.sender_id == Users.c.id,
-            Messages.c.thread_id == Threads.c.id
-      ))
-      .order_by(Messages.c.id)
-    )
-    return [
-        Message(row)
-        for row in chatty_connection.execute(query)
-    ]
-
-
-for message in lookup_sms_messages():
-    print(message)
+if "last-id" in CONFIG and CONFIG["last-id"] != last_id:
+  with open(CONFIG_FILE, "w") as f:
+    json.dump(CONFIG, f)
