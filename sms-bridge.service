@@ -1,0 +1,10 @@
+[Unit]
+Description=Bridge SMSes to matrix
+
+[Service]
+Type=simple
+ExecStart="/usr/bin/python3 /home/mobian/Documents/sms-bridge/main.py"
+User=mobian
+
+[Install]
+WantedBy=default.target

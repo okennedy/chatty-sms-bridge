@@ -1,0 +1,9 @@
+[Unit]
+Description=Bridge SMSes to matrix
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
